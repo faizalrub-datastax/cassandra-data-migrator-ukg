@@ -8,7 +8,6 @@ import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.time.LocalDate;
-import java.time.LocalTime;
 import java.util.*;
 
 public class MigrateDataType {
@@ -39,12 +38,15 @@ public class MigrateDataType {
             return true;
         } else if (source != null && astra == null) {
             return true;
-        }
-
+        } else if( source instanceof BigDecimal && astra instanceof BigDecimal ) {
+        	BigDecimal sourceConverted = (BigDecimal) source;
+        	BigDecimal astraConverted = (BigDecimal) astra;
+        	return !(sourceConverted.compareTo(astraConverted) == 0);
+        } 
         return !source.equals(astra);
     }
 
-    private Class getType(int type) {
+	private Class getType(int type) {
         switch (type) {
             case 0:
                 return String.class;
@@ -82,10 +84,6 @@ public class MigrateDataType {
                 return UdtValue.class;
             case 17:
                 return BigInteger.class;
-            case 18:
-                return LocalTime.class;
-            case 19:
-                return Short.class;
         }
 
         return Object.class;

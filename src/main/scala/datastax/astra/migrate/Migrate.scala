@@ -2,7 +2,6 @@ package datastax.astra.migrate
 
 import com.datastax.spark.connector.cql.CassandraConnector
 import org.slf4j.LoggerFactory
-import org.apache.spark.SparkConf
 
 import scala.collection.JavaConversions._
 
@@ -13,12 +12,12 @@ object Migrate extends AbstractJob {
   val logger = LoggerFactory.getLogger(this.getClass.getName)
   logger.info("Started Migration App")
 
-  migrateTable(sourceConnection, destinationConnection, sc)
+  migrateTable(sourceConnection, destinationConnection)
 
   exitSpark
 
-  private def migrateTable(sourceConnection: CassandraConnector, destinationConnection: CassandraConnector, config: SparkConf) = {
-    val partitions = SplitPartitions.getRandomSubPartitions(numSplits, minPartition, maxPartition, Integer.parseInt(coveragePercent))
+  private def migrateTable(sourceConnection: CassandraConnector, destinationConnection: CassandraConnector) = {
+    val partitions = SplitPartitions.getRandomSubPartitions(splitSize, minPartition, maxPartition, Integer.parseInt(coveragePercent))
     logger.info("PARAM Calculated -- Total Partitions: " + partitions.size())
     val parts = sContext.parallelize(partitions.toSeq, partitions.size);
     logger.info("Spark parallelize created : " + parts.count() + " parts!");
@@ -26,7 +25,7 @@ object Migrate extends AbstractJob {
     parts.foreach(part => {
       sourceConnection.withSessionDo(sourceSession =>
         destinationConnection.withSessionDo(destinationSession =>
-          CopyJobSession.getInstance(sourceSession, destinationSession, config)
+          CopyJobSession.getInstance(sourceSession, destinationSession, sc)
             .getDataAndInsert(part.getMin, part.getMax)))
     })
 

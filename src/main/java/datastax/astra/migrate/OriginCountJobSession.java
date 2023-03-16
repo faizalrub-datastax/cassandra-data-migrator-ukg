@@ -27,7 +27,7 @@ public class OriginCountJobSession extends BaseJobSession {
     protected List<MigrateDataType> checkTableforColSizeTypes = new ArrayList<MigrateDataType>();
 
     protected OriginCountJobSession(CqlSession sourceSession, SparkConf sc) {
-        super(sc);
+		super(sc);
         this.sourceSession = sourceSession;
         batchSize = new Integer(sc.get("spark.batchSize", "1"));
         printStatsAfter = new Integer(sc.get("spark.printStatsAfter", "100000"));
@@ -61,6 +61,7 @@ public class OriginCountJobSession extends BaseJobSession {
         sourceSelectStatement = sourceSession.prepare(
                 "select " + selectCols + " from " + sourceKeyspaceTable + " where token(" + partionKey.trim()
                         + ") >= ? and token(" + partionKey.trim() + ") <= ?  " + sourceSelectCondition + " ALLOW FILTERING");
+
     }
 
     public static OriginCountJobSession getInstance(CqlSession sourceSession, SparkConf sparkConf) {
@@ -77,9 +78,9 @@ public class OriginCountJobSession extends BaseJobSession {
 
     public void getData(BigInteger min, BigInteger max) {
         logger.info("ThreadID: {} Processing min: {} max: {}", Thread.currentThread().getId(), min, max);
-        boolean done = false;
-        int maxAttempts = maxRetries + 1;
-        for (int attempts = 1; attempts <= maxAttempts && !done; attempts++) {
+        int maxAttempts = maxRetries;
+        for (int retryCount = 1; retryCount <= maxAttempts; retryCount++) {
+
             try {
                 ResultSet resultSet = sourceSession.execute(sourceSelectStatement.bind(hasRandomPartitioner ?
                                 min : min.longValueExact(), hasRandomPartitioner ? max : max.longValueExact())
@@ -109,6 +110,7 @@ public class OriginCountJobSession extends BaseJobSession {
                             }
                         }
                     }
+
                 } else {
                     BatchStatement batchStatement = BatchStatement.newInstance(BatchType.UNLOGGED);
                     for (Row sourceRow : resultSet) {
@@ -138,13 +140,14 @@ public class OriginCountJobSession extends BaseJobSession {
                 }
 
                 logger.info("ThreadID: {} Final Read Record Count: {}", Thread.currentThread().getId(), readCounter.get());
-                done = true;
+                retryCount = maxAttempts;
             } catch (Exception e) {
-                logger.error("Error occurred during Attempt#: {}", attempts, e);
-                logger.error("Error with PartitionRange -- ThreadID: {} Processing min: {} max: {} -- Attempt# {}",
-                        Thread.currentThread().getId(), min, max, attempts);
+                logger.error("Error occurred retry#: {}", retryCount, e);
+                logger.error("Error with PartitionRange -- ThreadID: {} Processing min: {} max: {} -- Retry# {}",
+                        Thread.currentThread().getId(), min, max, retryCount);
             }
         }
+
     }
 
     private int GetRowColumnLength(Row sourceRow, String filterColType, Integer filterColIndex) {

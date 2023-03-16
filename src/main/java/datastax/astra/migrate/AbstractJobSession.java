@@ -12,8 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
-import java.util.Optional;
+import java.util.Map;
 import java.util.stream.IntStream;
 
 public class AbstractJobSession extends BaseJobSession {
@@ -25,16 +24,11 @@ public class AbstractJobSession extends BaseJobSession {
     }
 
     protected AbstractJobSession(CqlSession sourceSession, CqlSession astraSession, SparkConf sc, boolean isJobMigrateRowsFromFile) {
-        super(sc);
-
-        if (sourceSession == null) {
-            return;
-        }
-
+		super(sc);
         this.sourceSession = sourceSession;
         this.astraSession = astraSession;
 
-        batchSize = new Integer(Util.getSparkPropOr(sc, "spark.batchSize", "5"));
+        batchSize = new Integer(Util.getSparkPropOr(sc, "spark.batchSize", "1"));
         fetchSizeInRows = new Integer(Util.getSparkPropOr(sc, "spark.read.fetch.sizeInRows", "1000"));
         printStatsAfter = new Integer(Util.getSparkPropOr(sc, "spark.printStatsAfter", "100000"));
         if (printStatsAfter < 1) {
@@ -43,11 +37,16 @@ public class AbstractJobSession extends BaseJobSession {
 
         readLimiter = RateLimiter.create(new Integer(Util.getSparkPropOr(sc, "spark.readRateLimit", "20000")));
         writeLimiter = RateLimiter.create(new Integer(Util.getSparkPropOr(sc, "spark.writeRateLimit", "40000")));
-        maxRetries = Integer.parseInt(sc.get("spark.maxRetries", "0"));
+        maxRetries = Integer.parseInt(sc.get("spark.maxRetries", "10"));
+        maxRetriesRowFailure = Integer.parseInt(sc.get("spark.maxRetries.rowFailure", "2"));
 
         sourceKeyspaceTable = Util.getSparkProp(sc, "spark.origin.keyspaceTable");
         astraKeyspaceTable = Util.getSparkProp(sc, "spark.target.keyspaceTable");
 
+        tokenRangeExceptionDir = Util.getSparkProp(sc, "spark.tokenRange.exceptionDir");
+        rowExceptionDir = Util.getSparkProp(sc, "spark.row.exceptionDir");
+        exceptionFileName = sourceKeyspaceTable;
+        
         String ttlColsStr = Util.getSparkPropOrEmpty(sc, "spark.query.ttl.cols");
         if (null != ttlColsStr && ttlColsStr.trim().length() > 0) {
             for (String ttlCol : ttlColsStr.split(",")) {
@@ -69,6 +68,17 @@ public class AbstractJobSession extends BaseJobSession {
             batchSize = 1;
         }
 
+        enableDefaultTTL = Boolean
+                .parseBoolean(Util.getSparkPropOr(sc, "spark.target.default.ttl.enable", "false"));
+        if (enableDefaultTTL) {
+        	defaultTTL = Integer.parseInt(Util.getSparkPropOr(sc, "spark.target.default.ttl", "7776000"));
+        }
+        enableDefaultWriteTime = Boolean
+                .parseBoolean(Util.getSparkPropOr(sc, "spark.target.default.writetime.enable", "false"));
+        if (enableDefaultWriteTime) {
+        	defaultWriteTime = Long.parseLong(Util.getSparkPropOr(sc, "spark.target.default.writetime", "1640998861000"));
+        } 
+
         String minWriteTimeStampFilterStr =
                 Util.getSparkPropOr(sc, "spark.origin.minWriteTimeStampFilter", "0");
         if (null != minWriteTimeStampFilterStr && minWriteTimeStampFilterStr.trim().length() > 1) {
@@ -86,10 +96,9 @@ public class AbstractJobSession extends BaseJobSession {
             customWritetime = Long.parseLong(customWriteTimeStr);
         }
 
-        logger.info("PARAM -- Read Consistency: {}", readConsistencyLevel);
+		logger.info("PARAM -- Read Consistency: {}", readConsistencyLevel);
         logger.info("PARAM -- Write Consistency: {}", writeConsistencyLevel);
         logger.info("PARAM -- Write Batch Size: {}", batchSize);
-        logger.info("PARAM -- Max Retries: {}", maxRetries);
         logger.info("PARAM -- Read Fetch Size: {}", fetchSizeInRows);
         logger.info("PARAM -- Source Keyspace Table: {}", sourceKeyspaceTable);
         logger.info("PARAM -- Destination Keyspace Table: {}", astraKeyspaceTable);
@@ -98,6 +107,11 @@ public class AbstractJobSession extends BaseJobSession {
         logger.info("PARAM -- TTLCols: {}", ttlCols);
         logger.info("PARAM -- WriteTimestampFilterCols: {}", writeTimeStampCols);
         logger.info("PARAM -- WriteTimestampFilter: {}", writeTimeStampFilter);
+        logger.info("PARAM -- enableDefaultTTL: {}", enableDefaultTTL);
+        logger.info("PARAM -- defaultTTL: {}", defaultTTL);
+        logger.info("PARAM -- enableDefaultWriteTime: {}", enableDefaultWriteTime);
+        logger.info("PARAM -- defaultWriteTime: {}", defaultWriteTime);
+        
         if (writeTimeStampFilter) {
             logger.info("PARAM -- minWriteTimeStampFilter: {} datetime is {}", minWriteTimeStampFilter,
                     Instant.ofEpochMilli(minWriteTimeStampFilter / 1000));
@@ -106,14 +120,14 @@ public class AbstractJobSession extends BaseJobSession {
         }
 
         String selectCols = Util.getSparkProp(sc, "spark.query.origin");
-        String partitionKey = Util.getSparkProp(sc, "spark.query.origin.partitionKey");
+        String partionKey = Util.getSparkProp(sc, "spark.query.origin.partitionKey");
         String sourceSelectCondition = Util.getSparkPropOrEmpty(sc, "spark.query.condition");
-        if (!sourceSelectCondition.isEmpty() && !sourceSelectCondition.trim().toUpperCase().startsWith("AND")) {
+		if (!sourceSelectCondition.isEmpty() && !sourceSelectCondition.trim().toUpperCase().startsWith("AND")) {
             sourceSelectCondition = " AND " + sourceSelectCondition;
         }
-
+        
         final StringBuilder selectTTLWriteTimeCols = new StringBuilder();
-        allCols = selectCols.split(",");
+        String[] allCols = selectCols.split(",");
         ttlCols.forEach(col -> {
             selectTTLWriteTimeCols.append(",ttl(" + allCols[col] + ")");
         });
@@ -138,15 +152,18 @@ public class AbstractJobSession extends BaseJobSession {
         }
 
         String fullSelectQuery;
+        String fullSelectLatestQuery;
         if (!isJobMigrateRowsFromFile) {
-            fullSelectQuery = "select " + selectCols + selectTTLWriteTimeCols + " from " + sourceKeyspaceTable +
-                    " where token(" + partitionKey.trim() + ") >= ? and token(" + partitionKey.trim() + ") <= ?  " +
-                    sourceSelectCondition + " ALLOW FILTERING";
+            fullSelectQuery = "select " + selectCols + selectTTLWriteTimeCols + " from " + sourceKeyspaceTable + " where token(" + partionKey.trim()
+                    + ") >= ? and token(" + partionKey.trim() + ") <= ?  " + sourceSelectCondition + " ALLOW FILTERING";
         } else {
             fullSelectQuery = "select " + selectCols + selectTTLWriteTimeCols + " from " + sourceKeyspaceTable + " where " + insertBinds;
         }
+        fullSelectLatestQuery = "select " + selectCols + " from " + sourceKeyspaceTable + " where " + insertBinds;
         sourceSelectStatement = sourceSession.prepare(fullSelectQuery);
+        sourceSelectLatestStatement = sourceSession.prepare(fullSelectLatestQuery);
         logger.info("PARAM -- Query used: {}", fullSelectQuery);
+        logger.info("PARAM -- Latest Query used: {}", fullSelectLatestQuery);
 
         astraSelectStatement = astraSession.prepare(
                 "select " + insertCols + " from " + astraKeyspaceTable
@@ -173,21 +190,15 @@ public class AbstractJobSession extends BaseJobSession {
             }
 
             String fullInsertQuery = "insert into " + astraKeyspaceTable + " (" + insertCols + ") VALUES (" + insertBinds + ")";
-            if (!ttlCols.isEmpty()) {
+            if (!ttlCols.isEmpty() || enableDefaultTTL) {
                 fullInsertQuery += " USING TTL ?";
-                if (!writeTimeStampCols.isEmpty()) {
+                if (!writeTimeStampCols.isEmpty() || enableDefaultWriteTime) {
                     fullInsertQuery += " AND TIMESTAMP ?";
                 }
-            } else if (!writeTimeStampCols.isEmpty()) {
+            } else if (!writeTimeStampCols.isEmpty() || enableDefaultWriteTime) {
                 fullInsertQuery += " USING TIMESTAMP ?";
             }
             astraInsertStatement = astraSession.prepare(fullInsertQuery);
-        }
-
-        // Handle rows with blank values for 'timestamp' data-type in primary-key fields
-        tsReplaceValStr = Util.getSparkPropOr(sc, "spark.target.replace.blankTimestampKeyUsingEpoch", "");
-        if (!tsReplaceValStr.isEmpty()) {
-            tsReplaceVal = Long.parseLong(tsReplaceValStr);
         }
     }
 
@@ -207,12 +218,28 @@ public class AbstractJobSession extends BaseJobSession {
         } else {
             int index = 0;
             for (index = 0; index < selectColTypes.size(); index++) {
-                boundInsertStatement = getBoundStatement(sourceRow, boundInsertStatement, index, selectColTypes);
-                if (boundInsertStatement == null) return null;
+                MigrateDataType dataTypeObj = selectColTypes.get(index);
+                Class dataType = dataTypeObj.typeClass;
+
+                try {
+                    Object colData = getData(dataTypeObj, index, sourceRow);
+                    if (index < idColTypes.size() && colData == null && dataType == String.class) {
+                        colData = "";
+                    }
+                    boundInsertStatement = boundInsertStatement.set(index, colData, dataType);
+                } catch (NullPointerException e) {
+                    // ignore the exception for map values being null
+                    if (dataType != Map.class) {
+                        throw e;
+                    }
+                }
             }
 
             if (!ttlCols.isEmpty()) {
                 boundInsertStatement = boundInsertStatement.set(index, getLargestTTL(sourceRow), Integer.class);
+                index++;
+            }else if(enableDefaultTTL && defaultTTL > 0) {
+            	boundInsertStatement = boundInsertStatement.set(index, defaultTTL, Integer.class);
                 index++;
             }
             if (!writeTimeStampCols.isEmpty()) {
@@ -221,6 +248,8 @@ public class AbstractJobSession extends BaseJobSession {
                 } else {
                     boundInsertStatement = boundInsertStatement.set(index, getLargestWriteTimeStamp(sourceRow), Long.class);
                 }
+            }else if(enableDefaultWriteTime && defaultWriteTime > 0l) {
+                boundInsertStatement = boundInsertStatement.set(index, defaultWriteTime, Long.class);            	
             }
         }
 
@@ -241,60 +270,12 @@ public class AbstractJobSession extends BaseJobSession {
     public BoundStatement selectFromAstra(PreparedStatement selectStatement, Row sourceRow) {
         BoundStatement boundSelectStatement = selectStatement.bind().setConsistencyLevel(readConsistencyLevel);
         for (int index = 0; index < idColTypes.size(); index++) {
-            boundSelectStatement = getBoundStatement(sourceRow, boundSelectStatement, index, idColTypes);
-            if (boundSelectStatement == null) return null;
+            MigrateDataType dataType = idColTypes.get(index);
+            boundSelectStatement = boundSelectStatement.set(index, getData(dataType, index, sourceRow),
+                    dataType.typeClass);
         }
 
         return boundSelectStatement;
-    }
-
-    private BoundStatement getBoundStatement(Row sourceRow, BoundStatement boundSelectStatement, int index,
-                                             List<MigrateDataType> cols) {
-        MigrateDataType dataTypeObj = cols.get(index);
-        Object colData = getData(dataTypeObj, index, sourceRow);
-
-        // Handle rows with blank values in primary-key fields
-        if (index < idColTypes.size()) {
-            Optional<Object> optionalVal = handleBlankInPrimaryKey(index, colData, dataTypeObj.typeClass, sourceRow);
-            if (!optionalVal.isPresent()) {
-                return null;
-            }
-            colData = optionalVal.get();
-        }
-        boundSelectStatement = boundSelectStatement.set(index, colData, dataTypeObj.typeClass);
-        return boundSelectStatement;
-    }
-
-    protected Optional<Object> handleBlankInPrimaryKey(int index, Object colData, Class dataType, Row sourceRow) {
-        return handleBlankInPrimaryKey(index, colData, dataType, sourceRow, true);
-    }
-
-    protected Optional<Object> handleBlankInPrimaryKey(int index, Object colData, Class dataType, Row sourceRow, boolean logWarn) {
-        // Handle rows with blank values for 'String' data-type in primary-key fields
-        if (index < idColTypes.size() && colData == null && dataType == String.class) {
-            if (logWarn) {
-                logger.warn("For row with Key: {}, found String primary-key column {} with blank value",
-                        getKey(sourceRow), allCols[index]);
-            }
-            return Optional.of("");
-        }
-
-        // Handle rows with blank values for 'timestamp' data-type in primary-key fields
-        if (index < idColTypes.size() && colData == null && dataType == Instant.class) {
-            if (tsReplaceValStr.isEmpty()) {
-                logger.error("Skipping row with Key: {} as Timestamp primary-key column {} has invalid blank value. " +
-                        "Alternatively rerun the job with --conf spark.target.replace.blankTimestampKeyUsingEpoch=\"<fixed-epoch-value>\" " +
-                        "option to replace the blanks with a fixed timestamp value", getKey(sourceRow), allCols[index]);
-                return Optional.empty();
-            }
-            if (logWarn) {
-                logger.warn("For row with Key: {}, found Timestamp primary-key column {} with invalid blank value. " +
-                        "Using value {} instead", getKey(sourceRow), allCols[index], Instant.ofEpochSecond(tsReplaceVal));
-            }
-            return Optional.of(Instant.ofEpochSecond(tsReplaceVal));
-        }
-
-        return Optional.of(colData);
     }
 
 }
