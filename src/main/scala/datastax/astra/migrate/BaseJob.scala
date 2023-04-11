@@ -42,6 +42,9 @@ class BaseJob extends App {
   val destinationKeyStorePassword = Util.getSparkPropOrEmpty(sc, "spark.target.keyStore.password")
   val destinationEnabledAlgorithms = Util.getSparkPropOrEmpty(sc, "spark.target.enabledAlgorithms")
 
+  val gsmProjectId = Util.getSparkPropOrEmpty(sc, "spark.validator.gsmprojectid")
+  val secretName = Util.getSparkPropOrEmpty(sc, "spark.validator.secretname")
+
   val minPartition = new BigInteger(Util.getSparkPropOr(sc, "spark.origin.minPartition", "-9223372036854775808"))
   val maxPartition = new BigInteger(Util.getSparkPropOr(sc, "spark.origin.maxPartition", "9223372036854775807"))
   val coveragePercent = Util.getSparkPropOr(sc, "spark.coveragePercent", "100")

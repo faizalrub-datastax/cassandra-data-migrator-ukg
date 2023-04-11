@@ -5,20 +5,26 @@ import org.apache.spark.SparkConf
 
 class AbstractJob extends BaseJob {
 
+  val ASTRA_SECRET_VERSION_ID: String = "latest"
+
   abstractLogger.info("PARAM -- Min Partition: " + minPartition)
   abstractLogger.info("PARAM -- Max Partition: " + maxPartition)
   abstractLogger.info("PARAM -- Split Size: " + splitSize)
-  abstractLogger.info("PARAM -- Coverage Percent: " + coveragePercent)
+  abstractLogger.info("PARAM -- Coverage Percent: " + coveragePercent)  
 
   var sourceConnection = getConnection(true, sourceScbPath, sourceHost, sourceUsername, sourcePassword,
-    sourceTrustStorePath, sourceTrustStorePassword, sourceTrustStoreType, sourceKeyStorePath, sourceKeyStorePassword, sourceEnabledAlgorithms);
+    sourceTrustStorePath, sourceTrustStorePassword, sourceTrustStoreType, sourceKeyStorePath, sourceKeyStorePassword, 
+    sourceEnabledAlgorithms, gsmProjectId, secretName);
 
   var destinationConnection = getConnection(false, destinationScbPath, destinationHost, destinationUsername, destinationPassword,
-    destinationTrustStorePath, destinationTrustStorePassword, destinationTrustStoreType, destinationKeyStorePath, destinationKeyStorePassword, destinationEnabledAlgorithms);
+    destinationTrustStorePath, destinationTrustStorePassword, destinationTrustStoreType, destinationKeyStorePath, 
+    destinationKeyStorePassword, destinationEnabledAlgorithms, gsmProjectId, secretName);
 
   private def getConnection(isSource: Boolean, scbPath: String, host: String, username: String, password: String,
                             trustStorePath: String, trustStorePassword: String, trustStoreType: String,
-                            keyStorePath: String, keyStorePassword: String, enabledAlgorithms: String): CassandraConnector = {
+                            keyStorePath: String, keyStorePassword: String, enabledAlgorithms: String, gsmProjectId: String,
+                            secretName: String): CassandraConnector = {
+    
     var connType: String = "Source"
     if (!isSource) {
       connType = "Destination"
@@ -26,8 +32,33 @@ class AbstractJob extends BaseJob {
 
     var config: SparkConf = sContext.getConf
     if (scbPath.nonEmpty) {
-      abstractLogger.info(connType + ": Connecting to Astra using SCB: " + scbPath);
 
+      abstractLogger.info(connType + ": Connecting to Astra using SCB: " + scbPath);
+      abstractLogger.info("GSM Project Id Value : "+gsmProjectId)
+      abstractLogger.info("Secret Name : "+secretName)
+      if(gsmProjectId.nonEmpty && secretName.nonEmpty){
+
+      	abstractLogger.info(connType + ": Connecting to Astra using secure manager : ");
+	    GoogleSecretManagerHelper.getInstance().populateAstraCredentials(gsmProjectId,secretName)
+        val id: String = GoogleSecretManagerHelper.getInstance().getAstraClusterUserName()
+        val secret: String = GoogleSecretManagerHelper.getInstance().getAstraAuthenToken()
+
+        if(id.nonEmpty && secret.nonEmpty){
+          abstractLogger.info("Connecting using GSM");
+          return CassandraConnector(config
+          .set("spark.cassandra.auth.username", id)
+          .set("spark.cassandra.auth.password", secret)
+          .set("spark.cassandra.input.consistency.level", consistencyLevel)
+          .set("spark.cassandra.connection.config.cloud.path", scbPath))
+        }else{
+          abstractLogger.info("Connecting using USERNAME and PASSWORD");
+          return CassandraConnector(config
+          .set("spark.cassandra.auth.username", username)
+          .set("spark.cassandra.auth.password", password)
+          .set("spark.cassandra.input.consistency.level", consistencyLevel)
+          .set("spark.cassandra.connection.config.cloud.path", scbPath))
+        }
+      }
       return CassandraConnector(config
         .set("spark.cassandra.auth.username", username)
         .set("spark.cassandra.auth.password", password)
